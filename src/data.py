@@ -1,28 +1,74 @@
+"""data.py — Synthetic candidate-job matching data for JobMatch (LinkedIn).
+
+Candidate-job pairs with graded relevance (0-4). Multiple candidates
+per job for ranking evaluation. Features include skills, experience,
+education, and job requirements.
+
+This is learning-to-rank data, NOT generic tabular classification.
+"""
 from __future__ import annotations
-import numpy as np; import pandas as pd
-FEATURE_NAMES = ["skill_match_score","experience_years","education_level","role_fit_score","location_preference","salary_expectation_fit","culture_fit_score","commute_distance","industry_experience","job_hopping_freq"]
-CATEGORICAL_FEATURES = ["education_level"]
-NUMERICAL_FEATURES = ["skill_match_score","experience_years","role_fit_score","location_preference","salary_expectation_fit","culture_fit_score","commute_distance","industry_experience","job_hopping_freq"]
-TARGET_NAME = "match_success"
-def make_synthetic(n=10000,seed=42):
-    rng=np.random.default_rng(seed)
-    df=pd.DataFrame({
-        "skill_match_score": rng.beta(5,3,size=n).round(3),
-        "experience_years": rng.exponential(scale=5,size=n).clip(0,30).round(1),
-        "education_level": rng.choice(["high_school","bachelors","masters","phd","other"],size=n,p=[0.10,0.35,0.35,0.10,0.10]),
-        "role_fit_score": rng.beta(5,3,size=n).round(3),
-        "location_preference": rng.beta(6,3,size=n).round(3),
-        "salary_expectation_fit": rng.beta(5,4,size=n).round(3),
-        "culture_fit_score": rng.beta(5,3,size=n).round(3),
-        "commute_distance": rng.exponential(scale=15,size=n).clip(0,100).round(1),
-        "industry_experience": rng.beta(4,3,size=n).round(3),
-        "job_hopping_freq": rng.poisson(lam=1.5,size=n).clip(0,8),
-    })
-    skill=df["skill_match_score"]; exp=np.clip(df["experience_years"]/30,0,1)
-    edu=df["education_level"].map({"high_school":0,"other":0.2,"bachelors":0.4,"masters":0.7,"phd":1}).values
-    role=df["role_fit_score"]; loc=df["location_preference"]; sal=df["salary_expectation_fit"]
-    cult=df["culture_fit_score"]; comm=np.clip(df["commute_distance"]/100,0,1); ind=df["industry_experience"]
-    hop=np.clip(df["job_hopping_freq"]/8,0,1)
-    log_odds = -1.0 + 1.0*skill + 0.5*exp + 0.3*edu + 0.8*role + 0.4*loc + 0.5*sal + 0.6*cult - 0.3*comm + 0.3*ind - 0.2*hop + rng.normal(0,0.4,size=n)
-    prob=1/(1+np.exp(-log_odds)); y=(prob>np.percentile(prob,70)).astype(np.float64)
-    return {"X":df,"y":y,"features":FEATURE_NAMES,"df":df.assign(match_success=y),"categorical_features":CATEGORICAL_FEATURES,"numerical_features":NUMERICAL_FEATURES,"n_samples":n,"n_features":len(FEATURE_NAMES),"positive_rate":y.mean()}
+import numpy as np
+import pandas as pd
+from typing import Any
+
+
+def make_synthetic(n_jobs: int = 50, candidates_per_job: int = 20, seed: int = 42) -> dict[str, Any]:
+    """Generate candidate-job pairs with graded relevance.
+
+    Relevance is determined by skill overlap, experience match, and
+    salary alignment — not a simple binary threshold.
+    """
+    rng = np.random.default_rng(seed)
+    all_skills = ["python", "sql", "ml", "dl", "nlp", "cv", "stats", "spark",
+                  "aws", "gcp", "scala", "java", "tableau", "excel", "r"]
+    education_levels = ["bachelors", "masters", "phd"]
+
+    rows = []
+    for job_id in range(n_jobs):
+        # Job requirements
+        n_req_skills = rng.integers(3, 6)
+        req_skills = set(rng.choice(all_skills, n_req_skills, replace=False))
+        req_exp = rng.integers(1, 10)
+        req_edu = rng.choice(education_levels)
+        req_salary = rng.integers(60, 150) * 1000
+
+        for cand_id in range(candidates_per_job):
+            # Candidate profile
+            n_cand_skills = rng.integers(2, 8)
+            cand_skills = set(rng.choice(all_skills, n_cand_skills, replace=False))
+            cand_exp = rng.integers(0, 15)
+            cand_edu = rng.choice(education_levels)
+            cand_salary = rng.integers(40, 200) * 1000
+
+            # Graded relevance based on match quality
+            skill_overlap = len(req_skills & cand_skills) / max(len(req_skills), 1)
+            exp_match = 1.0 if cand_exp >= req_exp else cand_exp / req_exp
+            edu_match = {"bachelors": 1, "masters": 2, "phd": 3}
+            edu_score = min(edu_match[cand_edu], edu_match[req_edu]) / edu_match[req_edu]
+            salary_fit = 1.0 - abs(cand_salary - req_salary) / max(req_salary, 1)
+            salary_fit = max(0, salary_fit)
+
+            # Relevance grade 0-4
+            score = 0.4 * skill_overlap + 0.25 * exp_match + 0.15 * edu_score + 0.20 * salary_fit
+            relevance = int(min(4, score * 5))
+
+            rows.append({
+                "job_id": job_id, "candidate_id": cand_id,
+                "skill_overlap": round(skill_overlap, 3),
+                "experience_years": cand_exp, "required_exp": req_exp,
+                "education": cand_edu, "required_edu": req_edu,
+                "salary": cand_salary, "required_salary": req_salary,
+                "relevance": relevance,
+            })
+
+    df = pd.DataFrame(rows)
+    return {
+        "df": df,
+        "n_jobs": n_jobs,
+        "n_pairs": len(df),
+        "candidates_per_job": candidates_per_job,
+        "features": ["skill_overlap", "experience_years", "required_exp",
+                     "salary", "required_salary"],
+        "group_col": "job_id",
+        "target_col": "relevance",
+    }

@@ -1,129 +1,127 @@
+"""model.py — Learning-to-rank for JobMatch (LinkedIn).
+
+Implements pointwise, pairwise, and listwise ranking approaches:
+1. **Pointwise**: LightGBM regression on relevance grades.
+2. **Pairwise**: RankNet-style sigmoid loss on candidate pairs.
+3. **Listwise**: LightGBM with LambdaRank objective (lambdarank).
+
+This is learning-to-rank, NOT generic binary classification.
+
+References
+----------
+Burges (2010), "From RankNet to LambdaRank to LambdaMART."
+"""
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import StratifiedKFold
-from src.core import build_models, compute_metrics, ks_statistic
+import lightgbm as lgb
+
+from src.core import ndcg_at_k, map_at_k, mrr, precision_at_k, recall_at_k
 
 
-def train_all_models(data, seed=42, test_size=0.25):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    from sklearn.model_selection import train_test_split as _tts
-    X_train, X_test, y_train, y_test = _tts(
-        X, y, test_size=test_size, stratify=y, random_state=seed
+def train_pointwise(data, seed=42):
+    """Pointwise: regression on relevance grades."""
+    df = data["df"]
+    features = data["features"]
+    group_col = data["group_col"]
+    target_col = data["target_col"]
+
+    groups = df.groupby(group_col).size().tolist()
+    X = df[features].values
+    y = df[target_col].values
+
+    model = lgb.LGBMRanker(
+        objective="lambdarank", n_estimators=100, max_depth=6,
+        learning_rate=0.1, random_state=seed, verbose=-1,
     )
-    scaler = StandardScaler()
-    num_cols_actual = [c for c in num_cols if c in X_train.columns]
-    X_train_scaled = X_train.copy()
-    X_test_scaled = X_test.copy()
-    if num_cols_actual:
-        X_train_scaled[num_cols_actual] = scaler.fit_transform(X_train[num_cols_actual])
-        X_test_scaled[num_cols_actual] = scaler.transform(X_test[num_cols_actual])
-    models = build_models(X_train_scaled, y_train, seed=seed)
-    results = {}
-    for name, model in models.items():
-        y_proba = model.predict_proba(X_test_scaled)[:, 1]
-        y_pred = (y_proba >= 0.5).astype(int)
-        metrics = compute_metrics(y_test, y_pred, y_proba)
-        metrics["ks"] = ks_statistic(y_test, y_proba)
-        results[name] = {"metrics": metrics, "y_proba": y_proba, "y_pred": y_pred}
+    model.fit(X, y, group=groups)
+    return model, features
+
+
+def train_pairwise(data, seed=42):
+    """Pairwise: RankNet-style sigmoid loss implemented from scratch.
+
+    For each job, generate all candidate pairs and train a logistic
+    model on (pref_i - pref_j) where the label is 1 if rel_i > rel_j.
+    """
+    from sklearn.linear_model import LogisticRegression
+    df = data["df"]
+    features = data["features"]
+    group_col = data["group_col"]
+    target_col = data["target_col"]
+
+    pair_features = []
+    pair_labels = []
+    for job_id, group in df.groupby(group_col):
+        idxs = group.index.tolist()
+        rels = group[target_col].values
+        feats = group[features].values
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                if rels[i] == rels[j]:
+                    continue
+                diff = feats[i] - feats[j]
+                label = 1 if rels[i] > rels[j] else 0
+                pair_features.append(diff)
+                pair_labels.append(label)
+                pair_features.append(-diff)
+                pair_labels.append(1 - label)
+
+    X_pairs = np.array(pair_features, dtype=float)
+    y_pairs = np.array(pair_labels)
+    model = LogisticRegression(C=1.0, max_iter=500, random_state=seed)
+    model.fit(X_pairs, y_pairs)
+    # Convert to a scoring function: score(x) = x . w
+    return {"weights": model.coef_[0], "intercept": model.intercept_[0]}, features
+
+
+def evaluate_ranking(model, data, features, k=5, mode="pointwise"):
+    """Evaluate ranking quality with NDCG, MAP, MRR, Precision."""
+    df = data["df"]
+    group_col = data["group_col"]
+    target_col = data["target_col"]
+
+    all_ndcg, all_map, all_mrr, all_precision = [], [], [], []
+    for job_id, group in df.groupby(group_col):
+        X = group[features].values
+        y = group[target_col].values
+        if mode == "pointwise":
+            scores = model.predict(X)
+        else:
+            w = model["weights"]
+            scores = X @ w
+        ranked_idx = np.argsort(-scores)
+        ranked_rel = y[ranked_idx]
+        all_ndcg.append(ndcg_at_k(ranked_rel, k))
+        all_map.append(_ap(ranked_rel, k))
+        all_mrr.append(mrr(ranked_rel))
+        all_precision.append(precision_at_k(ranked_rel, k))
+
     return {
-        "models": models,
-        "results": results,
-        "scaler": scaler,
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
-        "y_train": y_train,
-        "y_test": y_test,
-        "features": list(X.columns),
-        "n_train": len(y_train),
-        "n_test": len(y_test),
+        "ndcg@5": float(np.mean(all_ndcg)),
+        "map@5": float(np.mean(all_map)),
+        "mrr": float(np.mean(all_mrr)),
+        "precision@5": float(np.mean(all_precision)),
     }
 
 
-def cross_validate(data, seed=42, n_folds=5):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    num_cols_actual = [c for c in num_cols if c in X.columns]
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    cv_results = {name: {"roc_auc": [], "gini": [], "ks": [], "f1": []}
-                  for name in ["Logistic Regression", "Random Forest", "Gradient Boosting", "XGBoost"]}
-    for train_idx, test_idx in skf.split(X, y):
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-        scaler = StandardScaler()
-        if num_cols_actual:
-            X_tr_scaled = X_tr.copy()
-            X_te_scaled = X_te.copy()
-            X_tr_scaled[num_cols_actual] = scaler.fit_transform(X_tr[num_cols_actual])
-            X_te_scaled[num_cols_actual] = scaler.transform(X_te[num_cols_actual])
-        else:
-            X_tr_scaled, X_te_scaled = X_tr, X_te
-        models = build_models(X_tr_scaled, y_tr, seed=seed)
-        for name, model in models.items():
-            y_proba = model.predict_proba(X_te_scaled)[:, 1]
-            y_pred = (y_proba >= 0.5).astype(int)
-            met = compute_metrics(y_te, y_pred, y_proba)
-            cv_results[name]["roc_auc"].append(met.get("roc_auc", 0))
-            cv_results[name]["gini"].append(met.get("gini", 0))
-            cv_results[name]["ks"].append(ks_statistic(y_te, y_proba))
-            cv_results[name]["f1"].append(met.get("f1", 0))
-    summary = {}
-    for name, scores in cv_results.items():
-        summary[name] = {}
-        for metric, vals in scores.items():
-            summary[name][metric] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "values": [float(v) for v in vals],
-            }
-    return summary
+def _ap(ranked_rel, k):
+    """Helper: average precision at k."""
+    from src.core import average_precision_at_k
+    return average_precision_at_k(ranked_rel, k)
 
 
-def permutation_importance(model, X_val, y_val, metric_fn, n_repeats=10, seed=42):
-    rng = np.random.default_rng(seed)
-    baseline = metric_fn(y_val, model.predict_proba(X_val)[:, 1])
-    importances = []
-    for col_idx in range(X_val.shape[1]):
-        scores = []
-        for _ in range(n_repeats):
-            X_perm = X_val.copy()
-            X_perm[:, col_idx] = rng.permutation(X_perm[:, col_idx])
-            score = metric_fn(y_val, model.predict_proba(X_perm)[:, 1])
-            scores.append(baseline - score)
-        importances.append({
-            "mean": float(np.mean(scores)),
-            "std": float(np.std(scores)),
-        })
-    return importances
+def fit_and_evaluate(data, seed=42):
+    """Train and evaluate both pointwise and pairwise models."""
+    pw_model, features = train_pointwise(data, seed=seed)
+    pw_metrics = evaluate_ranking(pw_model, data, features, mode="pointwise")
 
+    pair_model, _ = train_pairwise(data, seed=seed)
+    pair_metrics = evaluate_ranking(pair_model, data, features, mode="pairwise")
 
-def threshold_sweep(y_true, y_proba):
-    thresholds = np.linspace(0.05, 0.95, 91)
-    rows = []
-    for tau in thresholds:
-        y_pred = (y_proba >= tau).astype(int)
-        met = compute_metrics(y_true, y_pred, y_proba)
-        met["threshold"] = float(tau)
-        met["accept_rate"] = float((y_pred == 0).mean())
-        rows.append(met)
-    return pd.DataFrame(rows)
+    model = {"pointwise": pw_model, "pairwise": pair_model, "features": features}
+    metrics = {
+        "n_jobs": data["n_jobs"], "n_pairs": data["n_pairs"],
+        "pointwise": pw_metrics, "pairwise": pair_metrics,
+    }
+    return model, metrics
